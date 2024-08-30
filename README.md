@@ -1,4 +1,4 @@
-#equirements (Python)
+#Requirements (Python)
 python 3.10.9
 matplotlib 3.7.1
 MDAnalysis 2.3.0
