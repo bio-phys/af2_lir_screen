@@ -15,4 +15,4 @@ They generate input files, analyze the resulting structural predictions, and sum
 
 * msms 2.2.6.1  
 
-If you use these scripts for a scientific publication, please cite PLACEHOLDER.
+If you use these scripts for a scientific publication, please cite https://doi.org/10.1101/2024.09.06.611604 .
