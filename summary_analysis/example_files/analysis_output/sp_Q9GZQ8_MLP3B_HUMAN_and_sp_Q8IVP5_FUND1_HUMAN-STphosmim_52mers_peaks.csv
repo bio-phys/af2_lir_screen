@@ -1,2 +1,2 @@
-Start, End, sequence, type, fragment, av_pLDDT, av_minPAE
-16, 23, '16-DEY(HP1)EVL(HP2)DL-23', 'Canonical', 'sp_Q9GZQ8_MLP3B_HUMAN_and_sp_Q8IVP5_FUND1_HUMAN-STphosmim-1-52', 83.747427056974, 3.0494017601013184
+Start, End, Length, sequence, type, fragment, av_pLDDT, min_len_pLDDT, max_res_pLDDT, av_minPAE, min_len_minPAE, min_res_minPAE
+15, 23, 9, '15-DDEY(HP1)EVL(HP2)DL-23', 'can-LIR', 'sp_Q9GZQ8_MLP3B_HUMAN_and_sp_Q8IVP5_FUND1_HUMAN-STphosmim-1-52', 80.99684705425739, 91.19321183547257, 93.67954177967923, 2.371067523956299, 2.18202543258667, 1.9968303442001343

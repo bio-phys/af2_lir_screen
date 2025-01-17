@@ -1,5 +1,26 @@
 #Python functions to analyze the output from a fragment AlphaFold2 scan via Alphapulldown with the goal of identifying LIRs and otehr SLiMs
-#Version 2024-08-30, Jan Stuke
+
+#    This script is part of af2_lir_screen.
+#    Copyright (C) 2024  Jan Stuke
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    
+#Version 2 of the seq_scan_class.py by Jan F. M. Stuke, 18.01.2025
+#Notable changes:
+# 1) Transposed PAE values: Instead of minimum PAE in the bait residues, we now consider minimum PAE in the candidate residues
+# 2) Specific non-canonical LIR classes based on previous experimental evidence
+# 3) New and more easily interpretable scoring system
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -18,7 +39,7 @@ import os
 import json
 
 #Parameters
-msms_executable='/PATH/TO/MSMS/msms.x86_64Linux2.2.6.1' #For occlusion by residue depth calculation
+msms_executable='/home/tb/jastuke/programs/msms/msms.x86_64Linux2.2.6.1' #For occlusion by residue depth calculation
 
 #Functions
 
@@ -41,13 +62,13 @@ class seq_scan_system:
                         seq=seq[:-1]
         return seq, name
     
-    def __init__(self, fasta_path, bait_fasta, cand_fasta, name_add="", prefer_add=True, cand_start_residue_num=1, cand_chain_index=1, n_baits=1, output_dir="./", msa_type="frag_msa", frag_len="any", verbose=False):
+    def __init__(self, fasta_path, bait_fastas, cand_fasta, name_add="", prefer_add=True, cand_start_residue_num=1, cand_chain_index=1, n_baits=1, output_dir="./", msa_type="frag_msa", frag_len="any", verbose=False, temp_dir="./temp/"):
         """
         fasta_path (str): path to fasta files
         bait_fasta (str): name of fasta with bait sequence
         cand_fasta (str): name of fasta with candidate sequence
         name_add (str): addition to name some fragments may have
-        prefer_addition (bool): if True, fragments with the name addition will be preferred over those without IF their residue range is identical. If False, it will be the other way around.
+        prefer_add(bool): if True, fragments with the name addition will be preferred over those without IF their residue range is identical. If False, it will be the other way around.
         cand_start_residue_num (int): resnumber of first residue listed in fasta file
         cand_chain_index (int): index of candidate chain in structure files
         n_baits (int): number of baits used in every prediction
@@ -55,21 +76,33 @@ class seq_scan_system:
         msa_type (str): "frag_msa" (individual msa for every fragment) or "one_msa" (shared msa from full-length sequence)
         frag_len (str or int): "any" will take fragments of any length in the fragment_main_dir. With an int it will only take fragments of that length.
         verbose (bool): en/disable verbose output
+        temp_dir (str): path to temporary directory (used to store temporary files but not outputs)
         """
         if fasta_path[-1] != "/":
             fasta_path=fasta_path+"/"
-        self.bait_fasta=fasta_path+bait_fasta
+        self.bait_fastas=[]
+        self.bait_names=[]
+        self.bait_seqs=[]
+        #Compatibility with legacy notebooks who used single fastas and n_baits
+        if type(bait_fastas)!=list:
+            bait_fastas=[bait_fastas]*n_baits
+        #comaptibility code end
+        for bait_fasta in bait_fastas:
+            self.bait_fastas.append(fasta_path+bait_fasta)
+            bait_seq, bait_name=self.load_seq(fasta_path+bait_fasta)
+            self.bait_names.append(bait_name)
+            self.bait_seqs.append(bait_seq)
+            
         self.cand_fasta=fasta_path+cand_fasta
-        bait_seq, bait_name=self.load_seq(self.bait_fasta)
         cand_seq, cand_name=self.load_seq(self.cand_fasta)
-        self.name=str(n_baits*str(bait_name+"_and_")+cand_name).replace("|","_").replace("\n","")
+        self.name=str("_and_".join(self.bait_names)+"_and_"+cand_name).replace("|","_").replace("\n","")
         self.seq=cand_seq
-        self.len_bait_seq=len(bait_seq)
+        self.len_bait_seqs=[len(bait_seq) for bait_seq in self.bait_seqs]
         #Determine starting index of candidate chain
         self.cand_chain_index=cand_chain_index
-        self.start_index=self.cand_chain_index*self.len_bait_seq
+        self.start_index=sum(self.len_bait_seqs[:self.cand_chain_index])
         self.start_residue_num=cand_start_residue_num
-        self.n_baits=n_baits
+        self.n_baits=len(self.bait_seqs)
         self.name_add=name_add
         self.prefer_addition=prefer_add
         self.pLDDT={}
@@ -82,11 +115,14 @@ class seq_scan_system:
         self.msa_type=msa_type
         self.frag_len=frag_len
         self.verbose=verbose
+        self.temp_dir=temp_dir
+        if self.temp_dir[-1]=="/":
+            self.temp_dir=self.temp_dir[:-1]
     
-    def find_fragments(self, fragment_main_dir, name_addition_optional=True): #If name_addition_optional, the function will still prefer the fragment with or without addition (self.name_add) based on self.prefer_addition if available
+    def find_fragments(self, fragment_main_dir, name_addition_optional=True):
         """
         fragment_main_dir (str): path to alphapulldown output for the respective fragments
-        name_addition_optional (bool): If False, will only consider fragments with the addition. If True, it will also consider those without.
+        name_addition_optional (bool): If False, will only consider fragments with the addition. If True, it will also consider those without. If this case, the function will still prefer the fragment with or without addition (self.name_add) based on self.prefer_addition if available
         """    
         self.fragments=[]
         contains=self.name
@@ -153,10 +189,11 @@ class seq_scan_system:
         else:
             pass
  
-    def read_fragments(self, fragment_main_dir, av_over_for_minPAE=1):
+    def read_fragments(self, fragment_main_dir, av_over_for_minPAE=1, transpose_pae=True):
         """
         fragment_main_dir (str): path to alphapulldown output for the respective fragments
         av_over_for_minPAE (int): use average of the av_over_for_minPAE lowest PAE values for every residue of the fragment to calculate the minPAE
+        transpose_pae (bool): if True, aligns on bait and scores candidate residues, if False aligns on candidate and scores bait residues. 
         """
         if fragment_main_dir[-1] != "/":
             fragment_main_dir=fragment_main_dir+"/"
@@ -180,12 +217,14 @@ class seq_scan_system:
                     data=pickle.load(df)
                     frag_pLDDT=(data["plddt"])[self.start_index:int(self.start_index+1+int(residues[1])-int(residues[0]))]
                     frag_PAE=(data["predicted_aligned_error"])[self.start_index:int(self.start_index+1+int(residues[1])-int(residues[0]))]
+                    if transpose_pae==True: #With this, we get alignemnt on all but scores only for the candidate (instead of scoring the bait, though this also seems to work)
+                        frag_PAE=np.transpose(frag_PAE)  
                 for frag_resnum in range(0, int(residues[1])+1-int(residues[0]), 1):
                     res_pLDDT=frag_pLDDT[frag_resnum]
                     if self.start_index==0:
                         res_minPAE=np.mean(sorted((frag_PAE[frag_resnum])[int(residues[1])+1-int(residues[0]):])[:int(av_over_for_minPAE)], axis=None)
                     elif self.cand_chain_index==self.n_baits:
-                        res_minPAE=np.mean(sorted((frag_PAE[frag_resnum])[:int(self.len_bait_seq*self.n_baits)])[:int(av_over_for_minPAE)], axis=None)
+                        res_minPAE=np.mean(sorted((frag_PAE[frag_resnum])[:int(sum(self.len_bait_seqs))])[:int(av_over_for_minPAE)], axis=None)
                     else:
                         raise Exception("Not supoorted yet.")
                     resnum=int(residues[0])+int(frag_resnum)
@@ -209,7 +248,7 @@ class seq_scan_system:
     def evaluate_structure_of_fragment(self, fragment_main_dir):
         """
         LEGACY, NEVER IMPLEMENTED
-        """     
+        """    
         pass
                                           
     def calc_minmax(self):
@@ -307,14 +346,24 @@ class seq_scan_system:
             #Remove (completely/partially) overlapping peaks (or don't)
             if remove_overlap=="never":
                 for raw_peak in raw_peaks:
+                    peak_len=int(raw_peak["End"])+1-int(raw_peak["Start"])
                     av_pLDDT=np.mean([(self.pLDDT[key])[(raw_peak["fragment"])] for key in range(raw_peak["Start"], raw_peak["End"]+1 , 1)], axis=None)
+                    min_len_pLDDT=np.mean(np.sort(np.array([(self.pLDDT[key])[(raw_peak["fragment"])] for key in range(raw_peak["Start"], raw_peak["End"]+1 , 1)]))[-min_len:], axis=None) #Use the min_len highest pLDDT values
+                    max_res_pLDDT=np.sort(np.array([(self.pLDDT[key])[(raw_peak["fragment"])] for key in range(raw_peak["Start"], raw_peak["End"]+1 , 1)]))[-1]
                     av_minPAE=np.mean([(self.minPAE[key])[(raw_peak["fragment"])] for key in range(raw_peak["Start"], raw_peak["End"]+1 , 1)], axis=None)
-                    peak={"Start": int(raw_peak["Start"]), "End": int(raw_peak["End"]), "av_pLDDT": float(av_pLDDT), "av_minPAE": float(av_minPAE), "fragment": str((raw_peak["fragment"]))}
+                    min_len_minPAE=np.mean(np.sort(np.array([(self.minPAE[key])[(raw_peak["fragment"])] for key in range(raw_peak["Start"], raw_peak["End"]+1 , 1)]))[:min_len], axis=None) #Use the min_len lowest minPAE values
+                    min_res_minPAE=np.sort(np.array([(self.minPAE[key])[(raw_peak["fragment"])] for key in range(raw_peak["Start"], raw_peak["End"]+1 , 1)]))[0]
+                    peak={"Start": int(raw_peak["Start"]), "End": int(raw_peak["End"]), "Length": int(peak_len), "av_pLDDT": float(av_pLDDT), "min_len_pLDDT": float(min_len_pLDDT), "max_res_pLDDT": float(max_res_pLDDT), "av_minPAE": float(av_minPAE), "min_len_minPAE": float(min_len_minPAE), "min_res_minPAE": float(min_res_minPAE), "fragment": str((raw_peak["fragment"]))}
                     try:
                         peak["Start"]
                         peak["End"]
+                        peak["Length"]
                         peak["av_pLDDT"]
+                        peak["min_len_pLDDT"]
+                        peak["max_res_pLDDT"]
                         peak["av_minPAE"]
+                        peak["min_len_minPAE"]
+                        peak["min_res_minPAE"]
                         peak["fragment"]
                         self.peaks.append(peak)
                     except:
@@ -387,14 +436,24 @@ class seq_scan_system:
                             else:
                                 raise Exception("Unkown 'screen_by' value")
                     if better_peak_exists==False:
+                        peak_len=int(raw_peak["End"])+1-int(raw_peak["Start"])
                         av_pLDDT=np.mean([(self.pLDDT[key])[(raw_peak["fragment"])] for key in range(raw_peak["Start"], raw_peak["End"]+1 , 1)], axis=None)
+                        min_len_pLDDT=np.mean(np.sort(np.array([(self.pLDDT[key])[(raw_peak["fragment"])] for key in range(raw_peak["Start"], raw_peak["End"]+1 , 1)]))[-min_len:], axis=None) #Use the min_len highest pLDDT values
+                        max_res_pLDDT=np.sort(np.array([(self.pLDDT[key])[(raw_peak["fragment"])] for key in range(raw_peak["Start"], raw_peak["End"]+1 , 1)]))[-1]
                         av_minPAE=np.mean([(self.minPAE[key])[(raw_peak["fragment"])] for key in range(raw_peak["Start"], raw_peak["End"]+1 , 1)], axis=None)
-                        peak={"Start": int(raw_peak["Start"]), "End": int(raw_peak["End"]), "av_pLDDT": float(av_pLDDT), "av_minPAE": float(av_minPAE), "fragment": str((raw_peak["fragment"]))}
+                        min_len_minPAE=np.mean(np.sort(np.array([(self.minPAE[key])[(raw_peak["fragment"])] for key in range(raw_peak["Start"], raw_peak["End"]+1 , 1)]))[:min_len], axis=None) #Use the min_len lowest minPAE values
+                        min_res_minPAE=np.sort(np.array([(self.minPAE[key])[(raw_peak["fragment"])] for key in range(raw_peak["Start"], raw_peak["End"]+1 , 1)]))[0]
+                        peak={"Start": int(raw_peak["Start"]), "End": int(raw_peak["End"]), "Length": int(peak_len), "av_pLDDT": float(av_pLDDT), "min_len_pLDDT": float(min_len_pLDDT), "max_res_pLDDT": float(max_res_pLDDT), "av_minPAE": float(av_minPAE), "min_len_minPAE": float(min_len_minPAE), "min_res_minPAE": float(min_res_minPAE), "fragment": str((raw_peak["fragment"]))}
                         try:
                             peak["Start"]
                             peak["End"]
+                            peak["Length"]
                             peak["av_pLDDT"]
+                            peak["min_len_pLDDT"]
+                            peak["max_res_pLDDT"]
                             peak["av_minPAE"]
+                            peak["min_len_minPAE"]
+                            peak["min_res_minPAE"]
                             peak["fragment"]
                             self.peaks.append(peak)
                         except:
@@ -567,7 +626,7 @@ class seq_scan_system:
 
         print(f"Found {str(len(self.peaks))} peaks.")
 
-    def classify_peaks(self, fragment_main_dir, peaks_to_use="all", LC3="LC3B", chain_names=["B","C"], dssp_cutoff=-0.5, req_n_hbonds=2, n_contacts_threshold=5, d_contact_cutoff=5, high_conf_only=True, add_H=True): #dssp cutoff in kcal/mol, d_contact_cutoff in A between CAs
+    def classify_peaks(self, fragment_main_dir, peaks_to_use="all", LC3="LC3B", chain_names=["B","C"], dssp_cutoff=-0.5, req_n_hbonds=2, n_contacts_threshold=5, d_contact_cutoff=5, high_conf_only=True, add_H=True):
         """
         fragment_main_dir (str): path to alphapulldown output for the respective fragments
         peaks_to_use (str): "all" or "corelir" (use predefined residue window)
@@ -583,7 +642,7 @@ class seq_scan_system:
         if self.verbose==True:
             print("\nClassifying peaks.\n")
         try:
-            os.mkdir("./temp/")
+            os.mkdir(self.temp_dir)
         except:
             pass
         #Standard (self.peaks) or custom peaks
@@ -604,8 +663,8 @@ class seq_scan_system:
                 with pymol2.PyMOL() as pymol:
                     pymol.cmd.load(str(fragment_main_dir)+str(peak["fragment"]+"/ranked_0.pdb"), 'current_fragment')
                     pymol.cmd.h_add("backbone and not name CA")
-                    pymol.cmd.save("./temp/current_fragment.pdb")   
-                u_frag = mda.Universe("./temp/current_fragment.pdb")
+                    pymol.cmd.save(f"{self.temp_dir}/current_fragment.pdb")   
+                u_frag = mda.Universe(f"{self.temp_dir}/current_fragment.pdb")
             else:
                 u_frag = mda.Universe(str(fragment_main_dir)+str(peak["fragment"]+"/ranked_0.pdb"))
             if self.msa_type=="frag_msa":
@@ -628,18 +687,23 @@ class seq_scan_system:
             ###                        ###
             ### LC3-like bait proteins ###
             ###                        ###
-            if LC3 in ["LC3B", "Atg8", "Atg8CL", "Atg8E", "Atg8A", "GABARAP"]:   
+            if LC3 in ["LC3B", "LC3Aa", "LC3Ab", "LC3C", "Atg8", "Atg8CL", "Atg8E", "Atg8A", "GABARAP", "GABARAPL1", "GABARAPL2"]:   
                 #Check conditions for type of interactions
                     #1) Is it a (non)canonical LC3-LiR interaction?
                         #A) Any residues in HP1?
                 distances_HP1 = {"LC3B": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 108 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 52 and name CA"], "dists": [9.75, 5.25]}, #dist in A
+                                 "LC3Aa": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 108 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 52 and name CA"], "dists": [9.75, 5.25]},
+                                 "LC3Ab": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 112 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 56 and name CA"], "dists": [9.75, 5.25]},
+                                 "LC3C": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 114 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 58 and name CA"], "dists": [9.75, 5.25]},
                                  "GABARAP": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 104 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 49 and name CA"], "dists": [9.75, 5.25]},
+                                 "GABARAPL1": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 104 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 49 and name CA"], "dists": [9.75, 5.25]},
+                                 "GABARAPL2": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 104 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 49 and name CA"], "dists": [9.75, 5.25]},
                                  "Atg8": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 104 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 49 and name CA"], "dists": [9.75, 5.25]},
                                  "Atg8CL": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 105 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 50 and name CA"], "dists": [9.75, 5.25]},
-                                 "Atg8A": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 106 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 51 and name CA"], "dists": [9.75, 5.25]},
+                                 "Atg8A": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 105 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 50 and name CA"], "dists": [9.75, 5.25]},
                                  "Atg8E": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 106 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 51 and name CA"], "dists": [9.75, 5.25]}
                                 }
-                residue_in_HP1 = None
+                residue_in_HP1 = {"name": "EMPTY", "resnum": None}
                 i=-1
                 for residue in u_frag.select_atoms("chainID "+str(chain_names[self.cand_chain_index])).residues:
                     if high_conf_only == True:
@@ -649,6 +713,8 @@ class seq_scan_system:
                         else:
                             i=i+1
                             pass
+                    else:
+                        i=i+1
                     in_HP1 = False
                     for index, ref_atom in enumerate((distances_HP1[LC3])["atoms"]):
                         try:
@@ -660,21 +726,26 @@ class seq_scan_system:
                             in_HP1 = True
                         else:
                             in_HP1 = False
-                            break
+                            break #all conditions have to be met, so we can stop the loop once one is not fulfilled
                     if in_HP1 == True:
                         residue_in_HP1 = {"name": str(residue.resname), "resnum": int(residues[0])+i}
                         break
                     else:
                         continue
                         #B) Any residues in HP2?
-                distances_HP2 = {"LC3B": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 67 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 54 and name CA"], "dists": [9.50, 4.50]}, #dist in A
-                                 "GABARAP": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 64 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 51 and name CA"], "dists": [9.50, 4.50]},
-                                 "Atg8": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 64 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 51 and name CA"], "dists": [9.50, 4.50]},
-                                 "Atg8CL": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 65 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 52 and name CA"], "dists": [9.50, 4.50]},
-                                 "Atg8A": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 66 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 53 and name CA"], "dists": [9.50, 4.50]},
-                                 "Atg8E": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 66 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 53 and name CA"], "dists": [9.50, 4.50]}
+                distances_HP2 = {"LC3B": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 67 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 54 and name CA"], "dists": [9.50, 4.75]}, #dist in A
+                                 "LC3Aa": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 67 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 54 and name CA"], "dists": [9.50, 4.75]},
+                                 "LC3Ab": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 71 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 58 and name CA"], "dists": [9.50, 4.75]},
+                                 "LC3C": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 73 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 60 and name CA"], "dists": [9.50, 4.75]},
+                                 "GABARAP": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 64 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 51 and name CA"], "dists": [9.50, 4.75]},
+                                 "GABARAPL1": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 64 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 51 and name CA"], "dists": [9.50, 4.75]},
+                                 "GABARAPL2": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 64 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 51 and name CA"], "dists": [9.50, 4.75]},
+                                 "Atg8": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 64 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 51 and name CA"], "dists": [9.50, 4.75]},
+                                 "Atg8CL": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 65 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 52 and name CA"], "dists": [9.50, 4.75]},
+                                 "Atg8A": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 65 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 52 and name CA"], "dists": [9.50, 4.75]},
+                                 "Atg8E": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 66 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 53 and name CA"], "dists": [9.50, 4.75]}
                                 }
-                residue_in_HP2 = None
+                residue_in_HP2 = {"name": "EMPTY", "resnum": None}
                 i=-1
                 for residue in u_frag.select_atoms("chainID "+str(chain_names[self.cand_chain_index])).residues:
                     if high_conf_only == True:
@@ -684,6 +755,8 @@ class seq_scan_system:
                         else:
                             i=i+1
                             pass
+                    else:
+                        i=i+1
                     in_HP2 = False
                     for index, ref_atom in enumerate((distances_HP2[LC3])["atoms"]):
                         try: 
@@ -694,18 +767,23 @@ class seq_scan_system:
                             in_HP2 = True
                         else:
                             in_HP2 = False
-                            break
+                            break #all conditions have to be met, so we can stop the loop once one is not fulfilled
                     if in_HP2 == True:
                         residue_in_HP2 = {"name": str(residue.resname), "resnum": int(residues[0])+i}
-                        break
+                        break 
                     else:
                         continue
                         #C) Number of H-bonds with beta-sheet
                 LC3_betasheet_residues = {"LC3B": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 50:55",
+                                          "LC3Aa": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 50:55",
+                                          "LC3Ab": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 54:59",
+                                          "LC3C": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 56:61",
                                           "GABARAP": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 47:52",
+                                          "GABARAPL1": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 47:52",
+                                          "GABARAPL2": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 47:52",
                                           "Atg8": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 47:52",
                                           "Atg8CL": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 48:53",
-                                          "Atg8A": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 49:54",
+                                          "Atg8A": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 48:53",
                                           "Atg8E": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 49:54"
                                          }
                 n_hbonds=0
@@ -718,6 +796,8 @@ class seq_scan_system:
                         else:
                             i=i+1
                             pass
+                    else:
+                        i=i+1
                     for residue_LC3 in u_frag.select_atoms(LC3_betasheet_residues[LC3]).residues:
                         try:
                             donor_atomgroup=residue.atoms
@@ -765,86 +845,198 @@ class seq_scan_system:
                                 pass
                         except:
                             pass
-                        #D) Are the residues bound to HP1 and HP2 part of a canonical LiR sequence?
-                canonical_LiR=False
-                for x in range(0,1,1): #One iteration loop for breaking if one check fails
-                    HP1_canonical_residues=["TYR", "TRP", "PHE"]
-                    try:
-                        if residue_in_HP1["name"].upper() in HP1_canonical_residues:
-                            canonical_LiR=True
+                        #D) Is there a hydrophobic pocket 0 and if yes is there a residue in it?
+                opening_HP0= {"LC3B": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 7 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 50 and not name N CA C O and not type H"], "dist": 9.0}, #dist in A
+                                 "LC3Aa": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 7 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 50 and not name N CA C O and not type H"], "dist": 9.0},
+                                 "LC3Ab": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 11 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 54 and not name N CA C O and not type H"], "dist": 9.0},
+                                 "LC3C": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 13 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 56 and not name N CA C O and not type H"], "dist": 9.0},
+                                 "GABARAP": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 5 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 47 and not name N CA C O and not type H"], "dist": 9.0},
+                                 "GABARAPL1": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 5 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 47 and not name N CA C O and not type H"], "dist": 9.0},
+                                 "GABARAPL2": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 5 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 47 and not name N CA C O and not type H"], "dist": 9.0},
+                                 "Atg8": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 5 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 47 and not name N CA C O and not type H"], "dist": 9.0},
+                                 "Atg8CL": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 6 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 48 and not name N CA C O and not type H"], "dist": 9.0},
+                                 "Atg8A": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 6 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 48 and not name N CA C O and not type H"], "dist": 9.0},
+                                 "Atg8E": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 7 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 49 and not name N CA C O and not type H"], "dist": 9.0}
+                                }
+                try:
+                    #For alphapulldown data without relaxing the model, this is essentially heavy atom contacts to CA only, since the output structure does not contain H-atoms
+                    dmat = distances.distance_array(u_frag.select_atoms(((opening_HP0[LC3])["atoms"])[0]).positions, u_frag.select_atoms(((opening_HP0[LC3])["atoms"])[1]).positions, box=self.u.dimensions)
+                except:
+                    dmat = distances.distance_array(u_frag.select_atoms(((opening_HP0[LC3])["atoms"])[0]).positions, u_frag.select_atoms(((opening_HP0[LC3])["atoms"])[1]).positions) #In case no box is defined
+                if np.amin(dmat) <= float((opening_HP0[LC3])["dist"]):
+                    HP0_open = False
+                else:
+                    HP0_open = True
+                if HP0_open==True:
+                    distances_HP0 = {"LC3B": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 7 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 34 and name CA"], "dists": [4.50, 6.25]}, #dist in A
+                                     "LC3Aa": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 7 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 34 and name CA"], "dists": [4.50, 6.25]},
+                                     "LC3Ab": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 11 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 38 and name CA"], "dists": [4.50, 6.25]},
+                                     "LC3C": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 13 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 40 and name CA"], "dists": [4.50, 6.25]},
+                                     "GABARAP": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 5 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 32 and name CA"], "dists": [4.50, 6.25]},
+                                     "GABARAPL1": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 5 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 32 and name CA"], "dists": [4.50, 6.25]},
+                                     "GABARAPL2": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 5 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 32 and name CA"], "dists": [4.50, 6.25]},
+                                     "Atg8": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 5 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 32 and name CA"], "dists": [4.50, 6.25]},
+                                     "Atg8CL": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 6 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 33 and name CA"], "dists": [4.50, 6.25]},
+                                     "Atg8A": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 6 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 33 and name CA"], "dists": [4.50, 6.25]},
+                                     "Atg8E": {"atoms": ["chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 7 and name CA", "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 34 and name CA"], "dists": [4.50, 6.25]}
+                                    }
+                    residue_in_HP0 = {"name": "EMPTY", "resnum": None}
+                    i=-1
+                    for residue in u_frag.select_atoms("chainID "+str(chain_names[self.cand_chain_index])).residues:
+                        if high_conf_only == True:
+                            if int(residues[0]) + 1 + i < peak["Start"] or int(residues[0]) + 1 + i > peak["End"]: #Only include residues from the actual peak if high_conf_only==True
+                                i=i+1
+                                continue
+                            else:
+                                i=i+1
+                                pass
                         else:
-                            canonical_LiR=False
+                            i=i+1
+                        in_HP0 = False
+                        for index, ref_atom in enumerate((distances_HP0[LC3])["atoms"]):
+                            try:
+                                #For alphapulldown data without relaxing the model, this is essentially heavy atom contacts to CA only, since the output structure does not contain H-atoms
+                                dmat = distances.distance_array(residue.atoms.positions, u_frag.select_atoms(ref_atom).positions, box=self.u.dimensions)
+                            except:
+                                dmat = distances.distance_array(residue.atoms.positions, u_frag.select_atoms(ref_atom).positions) #In case no box is defined
+                            if np.amin(dmat) <= float(((distances_HP0[LC3])["dists"])[index]):
+                                in_HP0 = True
+                            else:
+                                in_HP0 = False
+                                break #all conditions have to be met, so we can stop the loop once one is not fulfilled
+                        if in_HP0 == True:
+                            residue_in_HP0 = {"name": str(residue.resname), "resnum": int(residues[0])+i}
                             break
-                    except:
-                        canonical_LiR=False
-                        break
-                    HP2_canonical_residues=["ILE", "LEU", "VAL"]
-                    try:
-                        if residue_in_HP2["name"].upper() in HP2_canonical_residues:
-                            canonical_LiR=True
                         else:
-                            canonical_LiR=False
-                            break
-                    except:
-                        canonical_LiR=False
-                        break
-                    try:
-                        if int(residue_in_HP2["resnum"])-int(residue_in_HP1["resnum"]) == 3:
-                            canonical_LiR=True
-                        else:
-                            canonical_LiR=False
-                            break
-                    except:
-                        canonical_LiR=False
-                        break
-                    #Write out the sequence of the peak and indicate HP1 and HP2 if existing
+                            continue
+                else:
+                    residue_in_HP0={"name": "EMPTY", "resnum": None}
+                        #E) Write out the sequence (raw and with HPs indicated)
+                raw_seq=''
                 seq=''
                 for i in range(peak["Start"], peak["End"]+1,1):
+                    raw_seq+=self.seq[int(i)-int(self.start_residue_num)]
                     seq+=self.seq[int(i)-int(self.start_residue_num)]
                     try:
-                        if i == residue_in_HP1["resnum"]:
+                        if i == residue_in_HP0["resnum"]: 
+                            seq+="(HP0)"
+                            continue
+                    except:
+                        pass
+                    try:
+                        if i == residue_in_HP1["resnum"]: 
                             seq+="(HP1)"
                             continue
                     except:
                         pass
                     try:
-                        if i == residue_in_HP2["resnum"]:
+                        if i == residue_in_HP2["resnum"]: 
                             seq+="(HP2)"
                             continue
                     except:
                         pass
                 peak["sequence"]=str(peak["Start"])+"-"+seq+"-"+str(peak["End"])
-                    # Evaluation -> If all are true: canonical, elif at least one is true: non-canonical, else: go to 2)
-                canonical_LiR_checks=[]
-                        #Check A) HP1
-                if residue_in_HP1 != None:
-                    canonical_LiR_checks.append(int(1))
-                        #Check B) HP2
-                if residue_in_HP2 != None:
-                    canonical_LiR_checks.append(int(2))
-                        #Check C) H-bonds
-                if int(n_hbonds) >= int(req_n_hbonds):
-                    canonical_LiR_checks.append(int(3))
-                        #Check D) 
-                if canonical_LiR == True:
-                    canonical_LiR_checks.append(int(4))
-                if self.verbose==True:
-                    print(f"Canonical LiR checks passed {str(canonical_LiR_checks)} (1: HP1, 2: HP2, 3: H-bonds, 4: Can. seq.).") 
-                        #Evaluation
-                if len(canonical_LiR_checks) == 4:
-                    peak["type"] = "Canonical"
-                    continue
-                elif len(canonical_LiR_checks) != 0:
-                    peak["type"] = "Non-canonical"
-                    continue
-                else:
+                        #F) Determine type of LIR
+                HP0_canonical_residues=["TYR", "TRP", "PHE"]
+                HP1_canonical_residues=["TYR", "TRP", "PHE"]
+                HP2_canonical_residues=["ILE", "LEU", "VAL"]
+                for x in range(0,1,1): #One iteration for loop so we can break at any time and skip the rest of it. Basically, a poor man's goto statement
+                            #i) Canonical LIR
+                    if residue_in_HP1["name"].upper() in HP1_canonical_residues and residue_in_HP2["name"].upper() in HP2_canonical_residues and n_hbonds >= req_n_hbonds:
+                        if residue_in_HP1["resnum"]-residue_in_HP2["resnum"]==-3:
+                            peak["type"] = "can-LIR"
+                            break
+                            #ii) Antiparallel LIR
+                        elif residue_in_HP1["resnum"]-residue_in_HP2["resnum"]==3:
+                            peak["type"] = "ap-LIR"
+                            break
+                        else:
+                            pass
+                            #iii) HP0 LIR
+                    if HP0_open==True and residue_in_HP0["name"].upper() in HP0_canonical_residues and residue_in_HP2["name"].upper() in HP2_canonical_residues and n_hbonds >= req_n_hbonds:
+                        HP1_seq_pos=residue_in_HP0["resnum"]-peak["Start"]+2
+                        if HP1_seq_pos>=0:
+                            try:
+                                if residue_in_HP0["resnum"]-residue_in_HP2["resnum"]==-5 and raw_seq[HP1_seq_pos] in ["I", "L", "V"]:
+                                    peak["type"] = "HP0-LIR"
+                                    break
+                                else:
+                                    pass
+                                    #iv) Motif non-canonical LIR (engages both hydrophobic pockets but at least one residue is not canonical)
+                            except:
+                                pass
+                        else:
+                            pass
+                    if residue_in_HP1["name"].upper()!="EMPTY" and residue_in_HP2["name"].upper()!="EMPTY":
+                        peak["type"] = "2-HP-LIR"
+                        break
+                            #v) CLIR
+                    if residue_in_HP2["name"].upper() in HP2_canonical_residues and n_hbonds >= req_n_hbonds:
+                        ali_pos1, ali_pos2=residue_in_HP2["resnum"]-peak["Start"]-2, residue_in_HP2["resnum"]-peak["Start"]-1
+                        if ali_pos1>=0 and ali_pos2>=0:
+                            try:
+                                if raw_seq[ali_pos1] in ["I", "L", "V", "M"] and raw_seq[ali_pos2] in ["I", "L", "V", "M"]:
+                                    peak["type"] = "CLIR"
+                                    break
+                                else:
+                                    pass
+                            except:
+                                pass
+                        else:
+                            pass
+                            #vi) sAIM
+                    if residue_in_HP1["name"].upper() in HP1_canonical_residues or (HP0_open==True and residue_in_HP0["name"].upper() in HP0_canonical_residues):
+                        if residue_in_HP1["name"].upper() in HP1_canonical_residues:
+                            shuffled_pos=residue_in_HP1["resnum"]-peak["Start"]-2
+                        else:
+                            shuffled_pos=residue_in_HP0["resnum"]-peak["Start"]-2
+                        if shuffled_pos>=0:
+                            try:
+                                if raw_seq[shuffled_pos] in ["I", "L", "V"]:
+                                    peak["type"] = "sAIM"
+                                    break
+                                else:
+                                    pass
+                            except:
+                                pass
+                        else:
+                            pass
+                            #vii) [DE]W[DE] LIR (e.g., BCL-2, TRIM5alpha)
+                    if residue_in_HP1["name"].upper() in ["TRP"]:
+                        acid_pos1, acid_pos2=residue_in_HP1["resnum"]-peak["Start"]-1, residue_in_HP1["resnum"]-peak["Start"]+1
+                        if acid_pos1>=0 and acid_pos2>=0:
+                            try:
+                                if raw_seq[acid_pos1] in ["E", "D"] and raw_seq[acid_pos2] in ["E", "D"]:
+                                    peak["type"] = "[DE]W[DE]-LIR"
+                                    break
+                                else:
+                                    pass
+                            except:
+                                pass
+                        else:
+                            pass
+                            #viii) speculative LIR
+                    if residue_in_HP1["name"].upper()!="EMPTY" or residue_in_HP2["name"].upper()!="EMPTY" or n_hbonds >= req_n_hbonds:
+                        peak["type"]="low-conf-LIR"
+                        break
+                    else:
+                        pass
+                try:
+                    peak["type"]
+                    continue #Skip next sections if peak was assigned
+                except:
                     pass
                     #2) Other binding mode proximal to LiR site: number of heavy atom contacts close to LiR binding site
                 LC3_LiR_site_residues = {"LC3B": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 50:55 and name CA",
+                                         "LC3Aa": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 50:55 and name CA",
+                                         "LC3Ab": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 54:59 and name CA", 
+                                         "LC3C": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 56:61 and name CA",
                                          "GABARAP": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 47:52 and name CA",
+                                         "GABARAPL1": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 47:52 and name CA",
+                                         "GABARAPL2": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 47:52 and name CA",
                                          "Atg8": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 47:52 and name CA",
                                          "Atg8CL": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 48:53 and name CA",
-                                         "Atg8A": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 49:54 and name CA",
+                                         "Atg8A": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 48:53 and name CA",
                                          "Atg8E": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 49:54 and name CA"
                                         }
                 if high_conf_only == True:
@@ -857,14 +1049,19 @@ class seq_scan_system:
                     dmat = distances.distance_array(u_frag.select_atoms(fragment_residues).positions, u_frag.select_atoms(LC3_LiR_site_residues[LC3]).positions) #In case no box is defined
                 LC3_LiR_site_n_contacts=np.sum(np.where(dmat[:,:] <= d_contact_cutoff, np.int8(1), np.int8(0)), axis=None)
                 if LC3_LiR_site_n_contacts >= n_contacts_threshold:
-                    peak["type"]="Other at LiR-site"
+                    peak["type"]="other@LDS"
                     continue
                     #3) Other binding mode proximal to Ub-like binding site: number of heavy atom contacts close to Ub-like binding site
                 LC3_UBQlike_site_residues = {"LC3B": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 79:82 and name CA",
+                                             "LC3Aa": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 79:82 and name CA",
+                                             "LC3Ab": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 83:86 and name CA",
+                                             "LC3C": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 85:88 and name CA",
                                              "GABARAP": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 76:79 and name CA",
+                                             "GABARAPL1": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 76:79 and name CA",
+                                             "GABARAPL2": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 76:79 and name CA",
                                              "Atg8": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 76:79 and name CA",
                                              "Atg8CL": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 77:80 and name CA",
-                                             "Atg8A": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 78:81 and name CA",
+                                             "Atg8A": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 77:80 and name CA",
                                              "Atg8E": "chainID "+str(chain_names[1-self.cand_chain_index])+" and resid 78:81 and name CA"
                                             }
                 if high_conf_only == True:
@@ -877,10 +1074,10 @@ class seq_scan_system:
                     dmat = distances.distance_array(u_frag.select_atoms(fragment_residues).positions, u_frag.select_atoms(LC3_UBQlike_site_residues[LC3]).positions) #In case no box is defined
                 LC3_UBQlike_site_n_contacts=np.sum(np.where(dmat[:,:] <= d_contact_cutoff, np.int8(1), np.int8(0)), axis=None)
                 if LC3_UBQlike_site_n_contacts >= n_contacts_threshold:
-                    peak["type"]="UBQ-like site"
+                    peak["type"]="UIM-like"
                     continue
                     #4) Other (currently everything not in 1-3 goes into 4)
-                peak["type"]="Other"
+                peak["type"]="other"
             ###                 ###
             ### SUMO-like baits ###
             ###                 ###
@@ -899,6 +1096,8 @@ class seq_scan_system:
                         else:
                             i=i+1
                             pass
+                    else:
+                        i=i+1
                     for residue_LC3 in u_frag.select_atoms(LC3_betasheet_residues[LC3]).residues:
                         try:
                             donor_atomgroup=residue.atoms
@@ -973,6 +1172,8 @@ class seq_scan_system:
                         else:
                             i=i+1
                             pass
+                    else:
+                        i=i+1
                     for residue_LC3 in u_frag.select_atoms(LC3_betasheet_residues[LC3]).residues:
                         try:
                             donor_atomgroup=residue.atoms
@@ -1029,7 +1230,18 @@ class seq_scan_system:
                 if n_hbonds>=req_n_hbonds:
                     peak["type"]="FIR"
                 else:
-                    peak["type"]="other" 
+                    peak["type"]="other"
+            ###                 ###
+            ### Other baits ###
+            ###                 ###
+            else:
+                #Write out the sequence of the peak
+                seq=''
+                for i in range(peak["Start"], peak["End"]+1,1):
+                    seq+=self.seq[int(i)-int(self.start_residue_num)]
+                peak["sequence"]=str(peak["Start"])+"-"+seq+"-"+str(peak["End"])
+                #Classification
+                peak["type"]="other"
         pass
     
     def plot_minmax(self, plot_by="min_minPAE", max_pLDDT_plot=100.0, max_minPAE_plot=45.0):
@@ -1095,7 +1307,7 @@ class seq_scan_system:
     def write_peaks_to_csv(self, overwrite=False):
         """
         overwrite (bool): overwrite existing file if True
-        """  
+        """          
         #File name
         if self.prefer_addition==True:
             if self.name_add in self.name:
@@ -1124,7 +1336,7 @@ class seq_scan_system:
         
         #Write self.peaks to file
             #Ordered keys for output
-        csv_keys=["Start", "End", "sequence", "type", "fragment", "av_pLDDT", "av_minPAE"]
+        csv_keys=["Start", "End", "Length", "sequence", "type", "fragment", "av_pLDDT", "min_len_pLDDT", "max_res_pLDDT", "av_minPAE", "min_len_minPAE", "min_res_minPAE"]
         
         #Transform peak dictionary into a sorted list of lines for the csv file [sorted by i) Binding site Start Resnum. ii) Fragment Start Resnum.]
         peak_list=[]
@@ -1164,7 +1376,7 @@ class seq_scan_system:
         treshold (float): treshold for iterative alignemnt in Angstrom
         max_cycles (int): maximum iterations for iterative alignment
         overwrite (bool): overwrite previously calculated RMSDs / RMSFs
-        """  
+        """          
         #Create dictionary to store results
         
         try:
@@ -1202,7 +1414,7 @@ class seq_scan_system:
        
             #Create temp directory
         try:
-            os.mkdir("./temp/")
+            os.mkdir(self.temp_dir)
         except:
             pass 
          
@@ -1211,7 +1423,7 @@ class seq_scan_system:
         for fragment in fragment_structures.keys():
             u_bait_and_frag = mda.Universe(fragment_structures[fragment])
             sel_bait=u_bait_and_frag.select_atoms("chainID "+str(chain_names[1-self.cand_chain_index]))
-            bait_temp_file=f"./temp/bait_for_{fragment}.pdb"
+            bait_temp_file=f"{self.temp_dir}/bait_for_{fragment}.pdb"
             sel_bait.write(bait_temp_file)
             if self.msa_type=="frag_msa":
                 residue_range=fragment.split("-")[-2:]
@@ -1231,11 +1443,16 @@ class seq_scan_system:
         #Selections for alignment and RMSD calculation
         
         LC3_align_on = {"LC3B": "backbone and not resid 1:5 116:125", #Exclude flexible termini
+                        "LC3Aa": "backbone and not resid 1:5 116:121",
+                        "LC3Ab": "backbone and not resid 1:9 120:125",
+                        "LC3C": "backbone and not resid 1:11 122:147",
                         "GABARAP": "backbone and not resid 1:3 111:117",
+                        "GABARAPL1": "backbone and not resid 1:3 111:117",
+                        "GABARAPL2": "backbone and not resid 1:3 111:117",
                         "Atg8": "backbone and not resid 1:3 111:117",
                         "Atg8CL": "backbone and not resid 1:4 112:119",
                         "Atg8E": "backbone and not resid 1:5 113:122",
-                        "Atg8A": "backbone and not resid 1:5 113:122",
+                        "Atg8A": "backbone and not resid 1:4 112:119",
                         "SUMO1": "backbone and resid 22:97",
                         "SUMO2": "backbone and resid 18:93",
                         "FIP200-Claw": "backbone and not resid 1:18 53:66 104:108",
@@ -1496,7 +1713,7 @@ class seq_scan_system:
 
 #Functions
 
-def get_occlusion_secstr(ref_structure, start_res_num=1, alphafold2=True, af2_treshold=70.0, use_simple=False):
+def get_occlusion_secstr(ref_structure, start_res_num=1, alphafold2=True, af2_threshold=70.0,use_simple=False):
     """
     ref_structure (str): pdb file name
     start_res_num (int): residue number of first residue in pdb
@@ -1504,7 +1721,6 @@ def get_occlusion_secstr(ref_structure, start_res_num=1, alphafold2=True, af2_tr
     af2_treshold (float): minimum pLDDT value for sec. str. assignment. Below will be considered "unstructured"
     use_simple (bool): if True use simple Sec. Str. assignemnts, if False the more detailed ones
     """
-
     #Secondary structure assignment
 
     #Map Value to letter
@@ -1566,7 +1782,7 @@ def get_occlusion_secstr(ref_structure, start_res_num=1, alphafold2=True, af2_tr
         pLDDTs=u.select_atoms("name CA").tempfactors
         for index, secstr in enumerate(secstr_matrix):
             resnum=index+start_res_num
-            if pLDDTs[index]<af2_treshold: #Residues with low confidence are considered not occluded
+            if pLDDTs[index]<af2_threshold: #Residues with low confidence are considered not occluded
                 occlusion_dic[resnum]=0
             else:
                 if (use_simple==False and secstr <= 2) or (use_simple==True and secstr <= 0): #Residues with helical- or sheet-like secondary structure are considered occluded, but indicated separately
@@ -1587,22 +1803,103 @@ def get_occlusion_secstr(ref_structure, start_res_num=1, alphafold2=True, af2_tr
 
     return occlusion_dic 
 
-def get_occlusion_depth(ref_structure, start_res_num=1):
+def get_occlusion_depth(ref_structure, start_res_num=1, alphafold2=True, af2_threshold=70.0, save_file=True, temp_dir="./temp/", add_more_probes=False):
     """
     ref_structure (str): pdb file name
     start_res_num (int): residue number of first residue in pdb
-    """
+    alphafold2 (bool): is the ref_structure an af prediction?
+    af2_treshold (float): minimum pLDDT value for sec. str. assignment. Below will be considered "unstructured"
+    save_file (bool): whether to save output to a csv file or not
+    temp_dir (str): path to temporary directory (for temporary files but not output)
+    add_more_probes (bool): If True, and alphafold2 True, the script function will tell msms to spawn additional probes in regularly spaced intervals. Can be useful when the respective structure is highly fragmented and probes get easily trapped.
+    """    
+    if alphafold2==False:
+        model = PDBParser().get_structure("model", ref_structure)[0]
+        res_depth = ResidueDepth(model, msms_exec=msms_executable)
+
+        occlusion_dic={}
+
+        for residue in res_depth.keys():
+            resnum=start_res_num+int((residue[1])[1])-1
+            depth=(res_depth[residue])[0]
+            occlusion_dic[resnum]=depth*0.1 #A -> nm
+    else:
+        keep_resids=[]
+        u=mda.Universe(ref_structure)
+        pLDDTs=u.select_atoms("name CA").tempfactors
+        for index, pLDDT in enumerate(pLDDTs):
+            if pLDDT>=af2_threshold: #Only residues at ot above the threshold are kept
+                keep_resids.append("resid "+str(index+1))
+            else:
+                pass
         
-    model = PDBParser().get_structure("model", ref_structure)[0]
-    res_depth = ResidueDepth(model, msms_exec=msms_executable)
+        if temp_dir[-1]=="/":
+            temp_dir=temp_dir[:-1]
+        try:
+            os.mkdir(temp_dir)
+        except:
+            pass
+        
+        sel_str=" or ".join(keep_resids)
+        u.select_atoms(sel_str).write(f"{temp_dir}/conf_structure.pdb")
+        
+        spawn_probes_at=[]
+        last_resnum=None
+        for index, atom in enumerate(u.select_atoms(sel_str).atoms):
+            current_resnum=atom.residue.resnum
+            if last_resnum==None:
+                spawn_probes_at.append((index, index+1)) #add probe spawn at beginning of new fragment
+            elif current_resnum-last_resnum<=1:
+                pass
+            else:
+                spawn_probes_at.append((index, index+1))
+                spawn_probes_at.append((index-2, index-1)) #add probe spawn at end of old fragment
+            last_resnum=current_resnum
+            last_index=index
+        spawn_probes_at.append((last_index-1, last_index)) #add probe at the end of last fragment
+        #Add additional probes at fixed intervals:
+        if add_more_probes==True:
+            for i in range(0, last_index+1, int(last_index/10)):
+                if i!=0 and i!=last_index and i!=last_index-1:
+                    spawn_probes_at.append((i, i+1))
+                
+        model = PDBParser().get_structure("model", f"{temp_dir}/conf_structure.pdb")[0]
+        res_depth_list = []
+        failed_probes=0
+        for probe_spawn in spawn_probes_at:
+            try:
+                res_depth_list.append(ResidueDepth(model, msms_exec=msms_executable+f" -one_cavity 2 {str(probe_spawn[0])} {str(probe_spawn[1])}"))
+            except:
+                failed_probes+=1
+        print(f"{str(failed_probes)} out of {str(len(spawn_probes_at))} probe spawns failed.")
+
+        depths=[]
+        
+        for residue in res_depth_list[0].keys():
+            depth=min([(res_depth[residue])[0] for res_depth in res_depth_list])
+            depths.append(depth*0.1) #A -> nm
+            
+        j=0
+        occlusion_dic={}
+        for index, pLDDT in enumerate(pLDDTs): #loop over all residues
+            resnum=start_res_num+index
+            if pLDDT>=af2_threshold:
+                occlusion_dic[resnum]=depths[j]
+                j+=1
+            else:
+                occlusion_dic[resnum]=None
     
-    occlusion_dic={}
-    
-    for residue in res_depth.keys():
-        resnum=start_res_num+int((residue[1])[1])-1
-        depth=(res_depth[residue])[0]
-        occlusion_dic[resnum]=depth
-    
+    if save_file==True:
+        with open(f"{ref_structure[:-4]}_res_depth.csv", "w") as f:
+            f.write("resnum, res. depth [nm]\n")
+            resnum_min=min(list(occlusion_dic.keys()))
+            resnum_max=max(list(occlusion_dic.keys()))
+            for k in range(resnum_min, resnum_max+1, 1):
+                if k!=resnum_max:
+                    f.write(f"{str(k)}, {str(occlusion_dic[k])}\n")
+                else:
+                    f.write(f"{str(k)}, {str(occlusion_dic[k])}")
+                    
     return occlusion_dic
     
     
@@ -1617,7 +1914,6 @@ def plot_summary(instance1, instance2, instance1_name="State_A", instance2_name=
     max_pLDDT_plot (float): upper pLDDT axis limit
     max_minPAE (float): upper minPAE axis limit
     """
-
     #by max pLDDT
     if plot_by=="max_pLDDT":
         #Instance 1
@@ -1707,12 +2003,13 @@ def plot_summary(instance1, instance2, instance1_name="State_A", instance2_name=
     
     #Peak Types
     
-    peak_colors = {"Canonical": "green", "SIM": "green", "FIR": "green", #Canonical LiR, SIM, and FIR are mutually exclusive 
-                   "Non-canonical": "yellow",
-                   "Other at LiR-site": "brown",
-                   "UBQ-like site": "purple",
+    peak_colors = {"can-LIR": "green", "SIM": "green", "FIR": "green", #Canonical LiR, SIM, and FIR are mutually exclusive 
+                   "ap-LIR": "yellow", "HP0-LIR": "yellow", "2-HP-LIR": "yellow", "CLIR": "yellow", "sAIM": "yellow", "[DE]W[DE]-LIR": "yellow",
+                   "low-conf-LIR": "cyan",
+                   "other@LDS": "brown",
+                   "UIM-like": "purple",
                    "FG-NUP": "pink",
-                   "Other": "grey"
+                   "other": "grey"
                   }
     
     #Plot Peaks
@@ -1720,9 +2017,9 @@ def plot_summary(instance1, instance2, instance1_name="State_A", instance2_name=
     for peak in instance1.peaks:
         try:
             if peak["type"] not in peak_colors.keys():
-                peak["type"]="Other"
+                peak["type"]="other"
         except:
-            peak["type"]="Other"
+            peak["type"]="other"
         for residue in range(peak["Start"], peak["End"]+1,1):
             residue_index=([residue_index_ for residue_index_, residue_ in enumerate(plot_pLDDT_1[:,0]) if residue_==residue])[0]
             axs[0].fill([residue-0.5, residue+0.5, residue+0.5, residue-0.5], [0.0, 0.0, min(plot_pLDDT_1[residue_index, 1], plot_pLDDT_2[residue_index, 1]), min(plot_pLDDT_1[residue_index, 1], plot_pLDDT_2[residue_index, 1])], color=peak_colors[(peak["type"])], alpha=0.5, linewidth=0)
@@ -1730,9 +2027,9 @@ def plot_summary(instance1, instance2, instance1_name="State_A", instance2_name=
     for peak in instance2.peaks:
         try:
             if peak["type"] not in peak_colors.keys():
-                peak["type"]="Other"
+                peak["type"]="other"
         except:
-            peak["type"]="Other"
+            peak["type"]="other"
         for residue in range(peak["Start"], peak["End"]+1,1):
             residue_index=([residue_index_ for residue_index_, residue_ in enumerate(plot_pLDDT_1[:,0]) if residue_==residue])[0]
             axs[0].fill([residue-0.5, residue+0.5, residue+0.5, residue-0.5], [max(plot_pLDDT_1[residue_index, 1], plot_pLDDT_2[residue_index, 1]), max(plot_pLDDT_1[residue_index, 1], plot_pLDDT_2[residue_index, 1]), max_pLDDT_plot, max_pLDDT_plot], color=peak_colors[(peak["type"])], alpha=0.5, linewidth=0)
@@ -1747,9 +2044,10 @@ def plot_summary(instance1, instance2, instance1_name="State_A", instance2_name=
             occlusion_data_resdepth=occlusion_data["ResDepth"]
             plot_occlusion=np.array([[key, occlusion_data_resdepth[key]] for key in occlusion_data_resdepth.keys()])
             plot_occlusion=plot_occlusion[plot_occlusion[:,0].argsort(kind="mergesort")]
-            axs[2].plot(plot_occlusion[:,0], 0.1*plot_occlusion[:,1], color="black", alpha=0.8)
-            axs[2].set_ylim([0.0, max(1.0,0.1*1.05*max(plot_occlusion[:,1]))])
-            axs[2].set_yticks([0.0,np.around(0.5*max(1.0,0.1*1.05*max(plot_occlusion[:,1])),1)])
+            max_occlusion=max([i if i!=None else 0 for i in plot_occlusion[:,1]])
+            axs[2].plot(plot_occlusion[:,0], plot_occlusion[:,1], color="black", alpha=0.8, linestyle="solid", marker="o", markersize=.5)
+            axs[2].set_ylim([0.0, max(1.0,1.05*max_occlusion)])
+            axs[2].set_yticks([0.0,np.around(0.5*max(1.0,1.05*max_occlusion),1)])
             axs[2].set_ylabel("r.d.\n[nm]", fontsize=label_fontsize, rotation=90)
             axs[2].grid(True, alpha=0.5)
         except:
@@ -1796,17 +2094,18 @@ def plot_summary(instance1, instance2, instance1_name="State_A", instance2_name=
         elif occlusion_type == "ResDepth":
             plot_occlusion=np.array([[key, occlusion_data[key]] for key in occlusion_data.keys()])
             plot_occlusion=plot_occlusion[plot_occlusion[:,0].argsort(kind="mergesort")]
-            axs[2].plot(plot_occlusion[:,0], 0.1*plot_occlusion[:,1], color="black", alpha=0.8)
-            axs[2].set_ylim([0.0, max(1.0,0.1*1.05*max(plot_occlusion[:,1]))])
-            axs[2].set_yticks([0.0,np.around(0.5*max(1.0,0.1*1.05*max(plot_occlusion[:,1])),1)])
+            max_occlusion=max([i if i!=None else 0 for i in plot_occlusion[:,1]])
+            axs[2].plot(plot_occlusion[:,0], plot_occlusion[:,1], color="black", alpha=0.8, linestyle="solid", marker="o", markersize=.5)
+            axs[2].set_ylim([0.0, max(1.0,1.05*max_occlusion)])
+            axs[2].set_yticks([0.0,np.around(0.5*max(1.0,1.05*max_occlusion),1)])
             axs[2].set_ylabel("r.d.\n[nm]", fontsize=label_fontsize, rotation=90)
             axs[2].grid(True, alpha=0.5)
         else:
             print("WARNING: Occlusion Type not recognized.")
             plot_occlusion=np.array([[key, occlusion_data[key]] for key in occlusion_data.keys()])
             plot_occlusion=plot_occlusion[plot_occlusion[:,0].argsort(kind="mergesort")]
-            axs[2].plot(plot_occlusion[:,0], 0.1*plot_occlusion[:,1], color="black", alpha=0.8)
-            axs[2].set_ylim([0.0, 0.1*1.05*max(plot_occlusion[:,1])])
+            axs[2].plot(plot_occlusion[:,0], plot_occlusion[:,1], color="black", alpha=0.8)
+            axs[2].set_ylim([0.0, 1.05*max(plot_occlusion[:,1])])
             axs[2].set_ylabel("Occ.", fontsize=label_fontsize, rotation=90)
         axs[2].tick_params(axis='both', which='both', labelsize=tick_fontsize)
         axs[2].set_xlabel("Residue Number", fontsize=label_fontsize)
@@ -1823,7 +2122,6 @@ def print_diff(instance1, instance2, print_type="pLDDT", print_range="all"):
     print_type (str): "pLDDT" or "minPAE"
     print_range (str or tuple): "all" or range
     """
- 
     if print_type=="pLDDT":
         diff_pLDDT_tab=np.array([[key, instance1.pLDDT_av[key]-instance2.pLDDT_av[key], instance1.pLDDT_max[key]-instance2.pLDDT_max[key]] for key in instance1.pLDDT_av.keys()])
         diff_pLDDT_tab=diff_pLDDT_tab[diff_pLDDT_tab[:,0].argsort(kind="mergesort")]
@@ -1845,17 +2143,18 @@ def print_diff(instance1, instance2, print_type="pLDDT", print_range="all"):
     else:
         print("Type not recognized. Choose 'pLDDT' or 'minPAE'")
 
-def plot_corelir_summary(instance1, instance2, instance1_name="State_A", instance2_name="State_B", indicate_msa_at_len=15, max_pLDDT_plot=100.0, max_minPAE_plot=45.0):
+def plot_corelir_summary(instance1, instance2, instance1_name="State_A", instance2_name="State_B", indicate_msa_at_len=15, min_pLDDT_plot=0.0, max_pLDDT_plot=100.0,  min_minPAE_plot=0.0, max_minPAE_plot=45.0):
     """
     instance1 (instance): an instance of the seq_scan_system class
     instance2 (instance): another instance of the seq_scan_system class
     instance1_name (str): name of instance1 for output
     instance2_name (str): name of instance2 for output
     indicate_msa_at_len (int): minimum fragment length required for AlphaFold2 to calculate and MSA
+    min_pLDDT_plot (float): lower pLDDT axis limit
     max_pLDDT_plot (float): upper pLDDT axis limit
+    min_minPAE (float): lower minPAE axis limit
     max_minPAE (float): upper minPAE axis limit
-    """
-    
+    """    
     #Instance 1
     corelir_dic1={}
     for corelir in instance1.corelir_scores:
@@ -1898,7 +2197,7 @@ def plot_corelir_summary(instance1, instance2, instance1_name="State_A", instanc
     axs[0].plot(sorted_scores1[:,0], sorted_scores1[:,1], color=colors["instance1"], alpha=0.8)
     axs[0].plot(sorted_scores2[:,0], sorted_scores2[:,1], color=colors["instance2"], alpha=0.8)
     axs[0].legend(fontsize=legend_fontsize, frameon=False)
-    axs[0].set_ylim([0.0,max_pLDDT_plot])
+    axs[0].set_ylim([min_pLDDT_plot,max_pLDDT_plot])
     axs[0].set_ylabel("pLDDT", fontsize=label_fontsize)
     axs[0].tick_params(axis='both', which='both', labelsize=tick_fontsize)
     axs[0].grid(True, alpha=0.5)
@@ -1906,7 +2205,7 @@ def plot_corelir_summary(instance1, instance2, instance1_name="State_A", instanc
     axs[1].plot(sorted_scores1[:,0], sorted_scores1[:,2], color=colors["instance1"], alpha=0.8)
     axs[1].plot(sorted_scores2[:,0], sorted_scores2[:,2], color=colors["instance2"], alpha=0.8)
     axs[1].legend(fontsize=legend_fontsize, frameon=False)
-    axs[1].set_ylim([0.0, max_minPAE_plot])
+    axs[1].set_ylim([min_minPAE_plot, max_minPAE_plot])
     axs[1].set_ylabel(r"minPAE [$\AA$]", fontsize=label_fontsize)
     axs[1].tick_params(axis='both', which='both', labelsize=tick_fontsize)
     axs[1].grid(True, alpha=0.5)
@@ -1966,12 +2265,13 @@ def plot_corelir_summary(instance1, instance2, instance1_name="State_A", instanc
     
     #Peak Types
     
-    peak_colors = {"Canonical": "green", "SIM": "green", "FIR": "green", #Canonical LIR, SIM and FIR are mutually exclusive
-                   "Non-canonical": "yellow",
-                   "Other at LiR-site": "brown",
-                   "UBQ-like site": "purple",
+    peak_colors = {"can-LIR": "green", "SIM": "green", "FIR": "green", #Canonical LiR, SIM, and FIR are mutually exclusive 
+                   "ap-LIR": "yellow", "HP0-LIR": "yellow", "2-HP-LIR": "yellow", "CLIR": "yellow", "sAIM": "yellow", "[DE]W[DE]-LIR": "yellow",
+                   "low-conf-LIR": "cyan",
+                   "other@LDS": "brown",
+                   "UIM-like": "purple",
                    "FG-NUP": "pink",
-                   "Other": "grey"
+                   "other": "grey"
                   }
     
     #Plot Peaks
@@ -1979,23 +2279,23 @@ def plot_corelir_summary(instance1, instance2, instance1_name="State_A", instanc
     for peak in instance1.corelir_scores:
         try:
             if peak["type"] not in peak_colors.keys():
-                peak["type"]="Other"
+                peak["type"]="other"
         except:
-            peak["type"]="Other"
+            peak["type"]="other"
         len_value=instance1.frag_lens[(peak["fragment"])]
         try:
             len_index1=([len_index_ for len_index_, len_ in enumerate(sorted_scores1[:,0]) if len_==len_value])[0] #Len value in data from instance1?
             len_index2=([len_index_ for len_index_, len_ in enumerate(sorted_scores2[:,0]) if len_==len_value])[0] #Len value in data from instance2?
         except:
             continue
-        axs[0].fill([len_value-0.5, len_value+0.5, len_value+0.5, len_value-0.5], [0.0, 0.0, min(sorted_scores1[len_index1, 1], sorted_scores2[len_index2, 1]), min(sorted_scores1[len_index1, 1], sorted_scores2[len_index2, 1])], color=peak_colors[(peak["type"])], alpha=0.5, linewidth=0)
+        axs[0].fill([len_value-0.5, len_value+0.5, len_value+0.5, len_value-0.5], [min_minPAE_plot, min_minPAE_plot, min(sorted_scores1[len_index1, 1], sorted_scores2[len_index2, 1]), min(sorted_scores1[len_index1, 1], sorted_scores2[len_index2, 1])], color=peak_colors[(peak["type"])], alpha=0.5, linewidth=0)
         axs[1].fill([len_value-0.5, len_value+0.5, len_value+0.5, len_value-0.5], [max(sorted_scores1[len_index1, 2], sorted_scores2[len_index2, 2]), max(sorted_scores1[len_index1, 2], sorted_scores2[len_index2, 2]), max_minPAE_plot, max_minPAE_plot], color=peak_colors[(peak["type"])], alpha=0.5, linewidth=0)
     for peak in instance2.corelir_scores:
         try:
             if peak["type"] not in peak_colors.keys():
-                peak["type"]="Other"
+                peak["type"]="other"
         except:
-            peak["type"]="Other"
+            peak["type"]="other"
         len_value=instance2.frag_lens[(peak["fragment"])]
         try:
             len_index1=([len_index_ for len_index_, len_ in enumerate(sorted_scores1[:,0]) if len_==len_value])[0] #Len value in data from instance1?
@@ -2003,14 +2303,14 @@ def plot_corelir_summary(instance1, instance2, instance1_name="State_A", instanc
         except:
             continue
         axs[0].fill([len_value-0.5, len_value+0.5, len_value+0.5, len_value-0.5], [max(sorted_scores1[len_index1, 1], sorted_scores2[len_index2, 1]), max(sorted_scores1[len_index1, 1], sorted_scores2[len_index2, 1]), max_pLDDT_plot, max_pLDDT_plot], color=peak_colors[(peak["type"])], alpha=0.5, linewidth=0)
-        axs[1].fill([len_value-0.5, len_value+0.5, len_value+0.5, len_value-0.5], [0.0, 0.0, min(sorted_scores1[len_index1, 2], sorted_scores2[len_index2, 2]), min(sorted_scores1[len_index1, 2], sorted_scores2[len_index2, 2])], color=peak_colors[(peak["type"])], alpha=0.5, linewidth=0)
+        axs[1].fill([len_value-0.5, len_value+0.5, len_value+0.5, len_value-0.5], [min_minPAE_plot, min_minPAE_plot, min(sorted_scores1[len_index1, 2], sorted_scores2[len_index2, 2]), min(sorted_scores1[len_index1, 2], sorted_scores2[len_index2, 2])], color=peak_colors[(peak["type"])], alpha=0.5, linewidth=0)
     
     axs[1].set_xlabel("Fragment Length", fontsize=label_fontsize)
     
     if indicate_msa_at_len != None:
-        axs[0].plot([indicate_msa_at_len,indicate_msa_at_len],[0,max_pLDDT_plot], color="black", linestyle=":")
-        axs[1].plot([indicate_msa_at_len,indicate_msa_at_len],[0,max_minPAE_plot], color="black", linestyle=":")
+        axs[0].plot([indicate_msa_at_len,indicate_msa_at_len],[min_pLDDT_plot,max_pLDDT_plot], color="black", linestyle=":")
+        axs[1].plot([indicate_msa_at_len,indicate_msa_at_len],[min_minPAE_plot,max_minPAE_plot], color="black", linestyle=":")
     
-    plot_name=str(instance1_name)+"-"+str(instance2_name)+"_summary_over_len.png"
+    plot_name=str(instance1_name)+"-"+str(instance2_name)+"_summary_over_len.pdf"
     plt.savefig(plot_name, dpi=1200, bbox_inches="tight")
     plt.show(block=False)
